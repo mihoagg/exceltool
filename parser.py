@@ -20,7 +20,9 @@ def split_conditions(rule_str: str) -> list[str]:
                 start = i + 1
             else:
                 after = rule_str[i+1:]
-                m = re.match(r'\s*([A-Za-z0-9]+)\s*(?:,\s*[A-Za-z0-9]+\s*)*(?:[=#]|>=|<=|>|<)', after)
+                m = re.match(r'\s*([A-Za-z]+)\s*(?:,\s*[A-Za-z]+\s*)*(?:[=#]|>=|<=|>|<)', after)
+                if not m:
+                    m = re.match(r'\s*(\d+)\s*(?:[=#]|>=|<=|>|<)', after)
                 if m:
                     parts.append(rule_str[start:i].strip())
                     start = i + 1
@@ -37,7 +39,9 @@ def split_conditions(rule_str: str) -> list[str]:
                     j += 1
                 if j < n:
                     rest = rule_str[j:]
-                    m = re.match(r'([A-Za-z0-9]+)\s*(?:[=#]|>=|<=|>|<)', rest)
+                    m = re.match(r'([A-Za-z]+)\s*(?:[=#]|>=|<=|>|<)', rest)
+                    if not m:
+                        m = re.match(r'(\d+)\s*(?:[=#]|>=|<=|>|<)', rest)
                     if m:
                         parts.append(buf)
                         start = j
