@@ -57,7 +57,7 @@ def split_conditions(rule_str: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-OP_RE = r"(?:>=|<=|>|<|=|#)"
+OP_RE = r"(?:>=|<=|==|>|<|=|#)"
 _CHAIN_RE = r"([A-Za-z0-9]+)\s*(" + OP_RE + r")\s*"
 
 
@@ -199,6 +199,7 @@ def _parse_single(expr: str) -> dict:
 
 _OP_MAP = {
     "=": "equals",
+    "==": "equals",
     "#": "not_equals",
     ">=": "gte",
     "<=": "lte",
@@ -213,7 +214,7 @@ def _build_node(field: str, op: str, vals: list[str]) -> dict:
         return {"type": "raw", "raw": f"{field}{op}{vals}"}
 
     if len(field) > 1 and field.isalpha():
-        if op == "=":
+        if op in ("=", "=="):
             return _decompose_equals(field, vals)
         if op == "#":
             return _decompose_not_equals(field, vals)
