@@ -21,7 +21,7 @@ EXCEL_PATH = Path(r"C:\Users\PhuThaiCAT\Desktop\Code\vnsky\dinh_dang_095_soluong
 SHEET_NAME = "Định dạng 095"
 API_BASE = "https://openrouter.ai/api/v1/chat/completions"
 BATCH_SIZE = 5
-BATCH_DELAY = 0.5
+BATCH_DELAY = 1
 
 
 def check_format(cell_value: str, parsed: dict) -> list[dict]:
@@ -120,11 +120,11 @@ For each cell, check:
 1. LOGICAL CONTRADICTIONS — impossible conditions like A=1 and A#1, A>5 and A<3, A=1 and A=2, A#1,2 where A is a single digit.
 
 2. AMBIGUOUS / QUIRKY SYNTAX — things the parser might misinterpret:
+   - Skip if output is correct
    - Number in values outside 0-9 (e.g., A=12)
    - Unusual characters in the template (dots, underscores, etc.) mixed with uppercase variable letters
    - Potentially unintended chain patterns
    - Trailing/missing commas or spaces
-
 Respond ONLY with a JSON object. Keys are cell indices (as strings: "0", "1", "2"...).
 Values are arrays of issues for that cell, or [] if none.
 
@@ -148,7 +148,12 @@ def _strip_markdown_json(raw: str) -> str:
     return raw
 
 
-def _call_llm(prompt: str, model: str, api_key: str) -> str | None:
+def _is_safety_response(text: str) -> bool:
+    t = text.strip().lower()
+    return not t.startswith("{") and not t.startswith("[") and ("safety" in t or "safe" in t or "content" in t)
+
+
+def _call_llm(prompt: str, model: str, api_key: str) -> tuple[str | None, dict | None]:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -163,12 +168,22 @@ def _call_llm(prompt: str, model: str, api_key: str) -> str | None:
     }
     try:
         resp = requests.post(API_BASE, headers=headers, json=payload, timeout=60)
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            detail = f"Rate limited" + (f", retry after {retry_after}s" if retry_after else "")
+            return None, {"type": "rate_limited", "retry_after": retry_after, "detail": detail}
         resp.raise_for_status()
         data = resp.json()
         content = data["choices"][0]["message"]["content"].strip()
-        return content
-    except Exception:
-        return None
+        if _is_safety_response(content):
+            return None, {"type": "safety_filter", "detail": content[:200]}
+        return content, None
+    except requests.Timeout:
+        return None, {"type": "timeout", "detail": "API request timed out after 60s"}
+    except requests.HTTPError as e:
+        return None, {"type": "http_error", "detail": f"HTTP {e.response.status_code}"}
+    except Exception as e:
+        return None, {"type": "exception", "detail": str(e)[:200]}
 
 
 LLM_ERROR_DIR = Path("llm_errors")
@@ -195,8 +210,10 @@ def _save_llm_error(raw: str, batch: list[dict]):
     print(f"    LLM error saved to {path}")
 
 
-def llm_check_batch(batch: list[dict], model: str, api_key: str) -> list[list[dict]]:
+def llm_check_batch(batch: list[dict], model: str, api_key: str,
+                    api_errors: list[dict]) -> list[list[dict]]:
     lines = []
+    batch_cells_info = []
     for i, entry in enumerate(batch):
         flat = _flatten_conditions(entry["conditions"])
         lines.append(f"[{i}]")
@@ -204,6 +221,11 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str) -> list[list[di
         lines.append(f'  Template: {entry["template"]}')
         lines.append(f'  Requirements: {entry["requirements"]}')
         lines.append(f"  Parsed conditions: {json.dumps(flat, indent=2)}")
+        batch_cells_info.append({
+            "cell": entry["cell"],
+            "template": entry["template"],
+            "requirements": entry["requirements"],
+        })
 
     prompt = "Cells to validate:\n\n" + "\n".join(lines)
 
@@ -221,35 +243,43 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str) -> list[list[di
                 pass
         return None
 
-    def _is_safety_response(text: str) -> bool:
-        t = text.strip().lower()
-        return not t.startswith("{") and not t.startswith("[") and ("safety" in t or "safe" in t or "content" in t)
-
-    max_attempts = 3
+    max_attempts = 5
     parsed = None
+    raw = None
     for attempt in range(max_attempts):
-        raw = _call_llm(prompt, model, api_key)
-        if raw is None:
-            if attempt == max_attempts - 1:
-                return [[{"stage": "llm", "type": "api_error", "severity": "warn", "detail": "LLM API call failed"}] for _ in batch]
-            print("    API error, retrying...")
-            time.sleep(2)
+        content, err = _call_llm(prompt, model, api_key)
+        if err:
+            api_errors.append({
+                "attempt": attempt + 1,
+                "error": err,
+                "batch_cells": batch_cells_info,
+            })
+            if attempt < max_attempts - 1:
+                reason = err.get("type", "error")
+                is_rate = reason == "rate_limited"
+                retry_after = err.get("retry_after")
+                if is_rate and retry_after:
+                    delay = int(retry_after)
+                else:
+                    delay = min(2 ** attempt * 5, 60)
+                print(f"    {reason}, waiting {delay}s ({attempt + 2}/{max_attempts})...")
+                time.sleep(delay)
             continue
 
+        raw = content
         parsed = try_parse(raw)
         if parsed is not None:
             break
 
-        is_safety = _is_safety_response(raw)
-        if is_safety:
-            _save_llm_error(raw, batch)
+        _save_llm_error(raw, batch)
         if attempt < max_attempts - 1:
-            print(f"    {'Safety filter' if is_safety else 'Parse'} error, retrying ({attempt + 2}/{max_attempts})...")
-            time.sleep(3 if is_safety else 1)
+            print(f"    Parse error, retrying ({attempt + 2}/{max_attempts})...")
+            time.sleep(1)
 
     if parsed is None:
         _save_llm_error(raw, batch)
-        return [[{"stage": "llm", "type": "parse_error", "severity": "warn", "detail": f"LLM returned unparseable: {raw[:200]}"}] for _ in batch]
+        return [[{"stage": "llm", "type": "parse_error", "severity": "warn",
+                   "detail": f"LLM returned unparseable: {(raw or '?')[:200]}"}] for _ in batch]
 
     results = []
     for i in range(len(batch)):
@@ -288,7 +318,7 @@ def _print_table(results: list[dict]):
     print(f"Total: {len(results)} | PASS: {pass_count} | WARN: {warn_count} | FAIL: {fail_count}")
 
 
-def _write_json(results: list[dict], path: str):
+def _write_json(results: list[dict], api_errors: list[dict], path: str):
     report = {
         "metadata": {
             "model": os.getenv("OPENROUTER_MODEL", "openrouter/free"),
@@ -300,6 +330,11 @@ def _write_json(results: list[dict], path: str):
             "warn": sum(1 for r in results if r["status"] == "WARN"),
             "fail": sum(1 for r in results if r["status"] == "FAIL"),
         },
+        "failures": [{"row": r["row"], "cell": r["cell"], "template": r["template"],
+                       "issues": r["issues"]} for r in results if r["status"] == "FAIL"],
+        "warnings": [{"row": r["row"], "cell": r["cell"], "template": r["template"],
+                       "issues": r["issues"]} for r in results if r["status"] == "WARN"],
+        "api_errors": api_errors,
         "results": results,
     }
     with open(path, "w", encoding="utf-8") as f:
@@ -325,6 +360,7 @@ def main():
     ws = wb[SHEET_NAME]
 
     results = []
+    api_errors: list[dict] = []
     total_rows = ws.max_row
     start_row = args.index or 2
     end_row = total_rows if args.max_rows is None else min(start_row + args.max_rows - 1, total_rows)
@@ -335,7 +371,7 @@ def main():
     def flush_batch():
         if not pending:
             return
-        batch_results = llm_check_batch(pending, model, api_key)
+        batch_results = llm_check_batch(pending, model, api_key, api_errors)
         for idx, extra_issues in zip(pending_cell_idx, batch_results):
             results[idx]["issues"].extend(extra_issues)
             results[idx]["status"] = _status(results[idx]["issues"])
@@ -398,7 +434,7 @@ def main():
 
     print()
     _print_table(results)
-    _write_json(results, args.output)
+    _write_json(results, api_errors, args.output)
     print(f"\nReport written to {args.output}")
 
 

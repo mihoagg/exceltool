@@ -20,7 +20,7 @@ def split_conditions(rule_str: str) -> list[str]:
                 start = i + 1
             else:
                 after = rule_str[i+1:]
-                m = re.match(r'\s*([A-Za-z]+)\s*(?:,\s*[A-Za-z]+\s*)*(?:[=#]|>=|<=|>|<)', after)
+                m = re.match(r'\s*([A-Za-z0-9]+)\s*(?:,\s*[A-Za-z0-9]+\s*)*(?:[=#]|>=|<=|>|<)', after)
                 if m:
                     parts.append(rule_str[start:i].strip())
                     start = i + 1
@@ -37,7 +37,7 @@ def split_conditions(rule_str: str) -> list[str]:
                     j += 1
                 if j < n:
                     rest = rule_str[j:]
-                    m = re.match(r'([A-Za-z]+)\s*(?:[=#]|>=|<=|>|<)', rest)
+                    m = re.match(r'([A-Za-z0-9]+)\s*(?:[=#]|>=|<=|>|<)', rest)
                     if m:
                         parts.append(buf)
                         start = j
@@ -54,7 +54,7 @@ def split_conditions(rule_str: str) -> list[str]:
 
 
 OP_RE = r"(?:>=|<=|>|<|=|#)"
-_CHAIN_RE = r"([A-Za-z]+)\s*(" + OP_RE + r")\s*"
+_CHAIN_RE = r"([A-Za-z0-9]+)\s*(" + OP_RE + r")\s*"
 
 
 def _find_matching_paren(s: str, start: int = 0) -> int:
