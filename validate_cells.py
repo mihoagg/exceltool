@@ -215,12 +215,11 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
     lines = []
     batch_cells_info = []
     for i, entry in enumerate(batch):
-        flat = _flatten_conditions(entry["conditions"])
         lines.append(f"[{i}]")
         lines.append(f'  Cell value: {entry["cell"]}')
         lines.append(f'  Template: {entry["template"]}')
         lines.append(f'  Requirements: {entry["requirements"]}')
-        lines.append(f"  Parsed conditions: {json.dumps(flat, indent=2)}")
+        lines.append(f"  Parsed conditions (full AST): {json.dumps(entry['conditions'], indent=2)}")
         batch_cells_info.append({
             "cell": entry["cell"],
             "template": entry["template"],
@@ -243,7 +242,7 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
                 pass
         return None
 
-    max_attempts = 5
+    max_attempts = 3
     parsed = None
     raw = None
     for attempt in range(max_attempts):
@@ -256,12 +255,9 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
             })
             if attempt < max_attempts - 1:
                 reason = err.get("type", "error")
-                is_rate = reason == "rate_limited"
                 retry_after = err.get("retry_after")
-                if is_rate and retry_after:
-                    delay = int(retry_after)
-                else:
-                    delay = min(2 ** attempt * 5, 60)
+                is_rate = reason == "rate_limited"
+                delay = int(retry_after) if (is_rate and retry_after) else min(2 ** attempt * 5, 10)
                 print(f"    {reason}, waiting {delay}s ({attempt + 2}/{max_attempts})...")
                 time.sleep(delay)
             continue
@@ -277,9 +273,15 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
             time.sleep(1)
 
     if parsed is None:
+        if len(batch) > 1:
+            mid = len(batch) // 2
+            print(f"    Batch failed, splitting into 2 sub-batches ({len(batch)} -> {mid}+{len(batch)-mid})...")
+            left = llm_check_batch(batch[:mid], model, api_key, api_errors)
+            right = llm_check_batch(batch[mid:], model, api_key, api_errors)
+            return left + right
         _save_llm_error(raw, batch)
-        return [[{"stage": "llm", "type": "parse_error", "severity": "warn",
-                   "detail": f"LLM returned unparseable: {(raw or '?')[:200]}"}] for _ in batch]
+        return [[{"stage": "llm", "type": "api_error", "severity": "warn",
+                   "detail": "LLM API call failed after all retries"}] for _ in batch]
 
     results = []
     for i in range(len(batch)):
