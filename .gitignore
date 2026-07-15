@@ -16,6 +16,7 @@ venv/
 # Generated reports
 validation_report.json
 *.json
+*.txt
 
 # IDE
 .vscode/

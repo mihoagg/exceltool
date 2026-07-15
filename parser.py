@@ -23,6 +23,8 @@ def split_conditions(rule_str: str) -> list[str]:
                 m = re.match(r'\s*([A-Za-z]+)\s*(?:,\s*[A-Za-z]+\s*)*(?:[=#]|>=|<=|>|<)', after)
                 if not m:
                     m = re.match(r'\s*(\d+)\s*(?:[=#]|>=|<=|>|<)', after)
+                if not m:
+                    m = re.match(r'\s*not\s+[A-Za-z0-9]', after)
                 if m:
                     parts.append(rule_str[start:i].strip())
                     start = i + 1
@@ -179,9 +181,8 @@ def _parse_single(expr: str) -> dict:
                             parts.append(rest_right)
                         break
                 children = []
-                for i in range(len(parts)):
-                    for j in range(i + 1, len(parts)):
-                        children.append(_build_node(parts[i], "#", [parts[j]]))
+                for i in range(len(parts) - 1):
+                    children.append(_build_node(parts[i], "#", [parts[i + 1]]))
                 if len(children) == 1:
                     return children[0]
                 return {"type": "and", "children": children}
@@ -346,7 +347,15 @@ def _expand_multi_field_conditions(conditions: list[str]) -> list[str]:
 def parse(rule_str: str) -> list[dict]:
     raw_conditions = split_conditions(rule_str)
     expanded = _expand_multi_field_conditions(raw_conditions)
-    return [parse_condition(c) for c in expanded if parse_condition(c)]
+    result = []
+    for c in expanded:
+        pc = parse_condition(c)
+        if pc:
+            if pc.get("type") == "and":
+                result.extend(pc["children"])
+            else:
+                result.append(pc)
+    return result
 
 
 def _resolve(v: str, context: dict) -> str:

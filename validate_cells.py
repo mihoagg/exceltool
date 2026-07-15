@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -123,19 +124,18 @@ def _flatten_conditions(conditions: list[dict]) -> list[dict]:
     return flat
 
 
-BATCH_SYSTEM_PROMPT = """You are a validator for a phone number formatting rule engine.
+BATCH_SYSTEM_PROMPT = """You validate a phone-number rule parser.
 Each cell contains a template pattern and optional rules using single-letter variables (A-Z) representing digit positions.
-The rules use operators: = (equals), # (not-equals), >=, <=, >, <.
-Multiple values are comma-separated: A=1,2,3.
-Variables can be compared with others: A#B
-Conditions combine with "and" / "or" / "not".
-Conditions can use chain operators and mix variables and integers.
+Operators: = , # (not-equals), >=, <=, >, <.
+Values are comma-separated: A=1,2,3 (this means A can only be 1, 2 or 3)
+Variables can be compared: A#B
+Conditions combine with "and" / "or" / "not". example: A#B, A#1 and B#2 -> all 3 conditions must be met at the same time. 
+Tere can be chain operators and mix vars and ints.
 
-You will receive MULTIPLE cells in a single message. Check EACH cell independently.
+You will receive MULTIPLE cells, Check EACH cell independently.
 
-For each cell, check:
-1. LOGICAL CONTRADICTIONS — impossible conditions like A=1 and A#1, A>5 and A<3, A=1 and A=2, A#1,2 where A is a single digit.
-
+Check for:
+1. Confirm parsed format is correct.
 2. AMBIGUOUS / QUIRKY SYNTAX — things the parser might misinterpret:
    - Skip if output is correct
    - Number in values outside 0-9 (e.g., A=12)
@@ -145,10 +145,9 @@ For each cell, check:
 Respond ONLY with a JSON object. Keys are cell indices (as strings: "0", "1", "2"...).
 Values are arrays of issues for that cell, or [] if none.
 
-Each issue: {"type": "contradiction"|"quirky_syntax", "severity": "warn"|"fail", "detail": "..."}
+Issue format: {"type": "incorrect_parse"|"quirky_syntax", "severity": "warn"|"fail", "detail": "..."}
 
-Example: {"0": [{"type": "contradiction", "severity": "fail", "detail": "A=1 and A#1 is impossible"}], "1": [], "2": [...]}
-Do NOT include any text outside the JSON object."""
+Output ONLY JSON object."""
 
 
 def _strip_markdown_json(raw: str) -> str:
@@ -252,17 +251,31 @@ def _save_llm_error(raw: str, batch: list[dict]):
     print(f"    LLM error saved to {path}")
 
 
+_FALSE_POSITIVE_PATTERNS = [
+    r"trailing comma",
+    # r"conflicts with.*and.*which violates",
+    # r"can both be",
+]
+
+
+def _is_false_positive(issue: dict) -> bool:
+    detail = issue.get("detail", "")
+    return any(re.search(p, detail, re.IGNORECASE) for p in _FALSE_POSITIVE_PATTERNS)
+
+
 def llm_check_batch(batch: list[dict], model: str, api_key: str,
                     api_errors: list[dict]) -> list[list[dict]]:
     lines = []
     batch_cells_info = []
     for i, entry in enumerate(batch):
         cond_strs = " -- ".join(_cond_to_str(c) for c in entry["conditions"])
+        template_vars = [ch for ch in entry["template"] if ch.isupper() and ch.isalpha()]
         lines.append(f"[{i}]")
-        lines.append(f'  Cell value: {entry["cell"]}')
-        lines.append(f'  Template: {entry["template"]}')
-        lines.append(f'  Requirements: {entry["requirements"]}')
-        lines.append(f"  Parsed conditions: {cond_strs}")
+        lines.append(f'  Cell: {entry["cell"]}')
+        lines.append(f'  Tpl: {entry["template"]}')
+        lines.append(f'  Vars: {{{",".join(sorted(set(template_vars)))}}}')
+        lines.append(f'  Req: {entry["requirements"]}')
+        lines.append(f"  Parsed: {cond_strs}")
         batch_cells_info.append({
             "cell": entry["cell"],
             "template": entry["template"],
@@ -334,9 +347,10 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
     for i in range(len(batch)):
         cell_issues = parsed.get(str(i), [])
         if isinstance(cell_issues, list):
-            for issue in cell_issues:
+            filtered = [i for i in cell_issues if not _is_false_positive(i)]
+            for issue in filtered:
                 issue["stage"] = "llm"
-            results.append(cell_issues)
+            results.append(filtered)
         else:
             results.append([])
     return results
@@ -471,6 +485,7 @@ def main():
             "cell": cell_value,
             "template": parsed.get("number", ""),
             "requirements": requirements,
+            "parsed_conditions": " -- ".join(_cond_to_str(c) for c in conditions) if conditions else "",
             "status": _status(issues),
             "issues": issues,
         }
