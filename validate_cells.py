@@ -20,7 +20,8 @@ if hasattr(sys.stdout, "reconfigure"):
 EXCEL_PATH = Path(r"C:\Users\PhuThaiCAT\Desktop\Code\vnsky\dinh_dang_095_soluong.xlsx")
 SHEET_NAME = "Định dạng 095"
 API_BASE = "https://openrouter.ai/api/v1/chat/completions"
-BATCH_SIZE = 5
+FAIL_LOG = Path("failures.jsonl")
+BATCH_SIZE = 10
 BATCH_DELAY = 1
 
 
@@ -153,6 +154,30 @@ def _is_safety_response(text: str) -> bool:
     return not t.startswith("{") and not t.startswith("[") and ("safety" in t or "safe" in t or "content" in t)
 
 
+def _parse_429_body(resp) -> dict:
+    info = {"type": "rate_limited", "reset_ms": None, "detail": "Rate limited"}
+    try:
+        body = resp.json()
+        err = body.get("error", {})
+        md = err.get("metadata", {})
+        hdrs = md.get("headers", {})
+        reset_ms = hdrs.get("X-RateLimit-Reset")
+        if reset_ms:
+            info["reset_ms"] = int(reset_ms)
+        limit = hdrs.get("X-RateLimit-Limit")
+        remaining = hdrs.get("X-RateLimit-Remaining")
+        msg = err.get("message", "")
+        if msg:
+            info["detail"] = msg[:200]
+        if remaining:
+            info["remaining"] = remaining
+        if limit:
+            info["limit"] = limit
+    except Exception:
+        info["detail"] = resp.text[:200]
+    return info
+
+
 def _call_llm(prompt: str, model: str, api_key: str) -> tuple[str | None, dict | None]:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -169,12 +194,13 @@ def _call_llm(prompt: str, model: str, api_key: str) -> tuple[str | None, dict |
     try:
         resp = requests.post(API_BASE, headers=headers, json=payload, timeout=60)
         if resp.status_code == 429:
-            retry_after = resp.headers.get("Retry-After")
-            detail = f"Rate limited" + (f", retry after {retry_after}s" if retry_after else "")
-            return None, {"type": "rate_limited", "retry_after": retry_after, "detail": detail}
+            return None, _parse_429_body(resp)
         resp.raise_for_status()
         data = resp.json()
-        content = data["choices"][0]["message"]["content"].strip()
+        content = data["choices"][0]["message"].get("content")
+        if not content:
+            return None, {"type": "empty_response", "detail": "Model returned null content"}
+        content = content.strip()
         if _is_safety_response(content):
             return None, {"type": "safety_filter", "detail": content[:200]}
         return content, None
@@ -242,7 +268,7 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
                 pass
         return None
 
-    max_attempts = 3
+    max_attempts = 10
     parsed = None
     raw = None
     for attempt in range(max_attempts):
@@ -253,12 +279,22 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
                 "error": err,
                 "batch_cells": batch_cells_info,
             })
-            if attempt < max_attempts - 1:
-                reason = err.get("type", "error")
-                retry_after = err.get("retry_after")
-                is_rate = reason == "rate_limited"
-                delay = int(retry_after) if (is_rate and retry_after) else min(2 ** attempt * 5, 10)
-                print(f"    {reason}, waiting {delay}s ({attempt + 2}/{max_attempts})...")
+            if attempt >= max_attempts - 1:
+                break
+            reason = err.get("type", "error")
+            if reason == "rate_limited":
+                reset_ms = err.get("reset_ms")
+                if reset_ms:
+                    now_ms = int(time.time() * 1000)
+                    wait = max(0, (reset_ms - now_ms) // 1000 + 5)
+                    print(f"    Rate limit hit — waiting {wait}s until reset...")
+                    time.sleep(wait)
+                else:
+                    print(f"    Rate limit hit, retrying in 10s ({attempt + 2}/{max_attempts})...")
+                    time.sleep(10)
+            else:
+                delay = min(2 ** attempt * 5, 30)
+                print(f"    {reason}, retrying in {delay}s ({attempt + 2}/{max_attempts})...")
                 time.sleep(delay)
             continue
 
@@ -273,12 +309,6 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
             time.sleep(1)
 
     if parsed is None:
-        if len(batch) > 1:
-            mid = len(batch) // 2
-            print(f"    Batch failed, splitting into 2 sub-batches ({len(batch)} -> {mid}+{len(batch)-mid})...")
-            left = llm_check_batch(batch[:mid], model, api_key, api_errors)
-            right = llm_check_batch(batch[mid:], model, api_key, api_errors)
-            return left + right
         _save_llm_error(raw, batch)
         return [[{"stage": "llm", "type": "api_error", "severity": "warn",
                    "detail": "LLM API call failed after all retries"}] for _ in batch]
@@ -293,6 +323,20 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
         else:
             results.append([])
     return results
+
+
+def _log_failure(result: dict):
+    if result["status"] == "PASS":
+        return
+    entry = {
+        "row": result["row"],
+        "status": result["status"],
+        "cell": result["cell"],
+        "template": result.get("template", ""),
+        "issues": [{"stage": i["stage"], "type": i["type"], "severity": i["severity"], "detail": i["detail"][:120]} for i in result["issues"]],
+    }
+    with open(FAIL_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def _status(issues: list[dict]) -> str:
@@ -378,6 +422,7 @@ def main():
             results[idx]["issues"].extend(extra_issues)
             results[idx]["status"] = _status(results[idx]["issues"])
             r = results[idx]
+            _log_failure(r)
             print(f"  Row {r['row']:4d} | {r['status']:6s} | issues: {len(r['issues'])}")
         pending.clear()
         pending_cell_idx.clear()
@@ -427,6 +472,7 @@ def main():
             if len(pending) >= BATCH_SIZE:
                 flush_batch()
         else:
+            _log_failure(result)
             print(f"  Row {row_idx:4d} | {result['status']:6s} | (no rules)")
 
     if pending:
