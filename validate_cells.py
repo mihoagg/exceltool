@@ -97,6 +97,21 @@ def check_variables(template: str, conditions: list[dict]) -> list[dict]:
     return issues
 
 
+def _cond_to_str(cond: dict) -> str:
+    t = cond.get("type")
+    if t == "and":
+        return "(" + " and ".join(_cond_to_str(c) for c in cond.get("children", [])) + ")"
+    if t == "or":
+        return "(" + " or ".join(_cond_to_str(c) for c in cond.get("children", [])) + ")"
+    if t == "not":
+        return "not " + _cond_to_str(cond["children"][0])
+    field = cond.get("field", "?")
+    op_map = {"equals": "=", "not_equals": "#", "gte": ">=", "lte": "<=", "gt": ">", "lt": "<"}
+    op = op_map.get(t, "?")
+    vals = ", ".join(cond.get("values", []))
+    return f"{field} {op} {vals}"
+
+
 def _flatten_conditions(conditions: list[dict]) -> list[dict]:
     flat = []
     for c in conditions:
@@ -112,6 +127,7 @@ BATCH_SYSTEM_PROMPT = """You are a validator for a phone number formatting rule 
 Each cell contains a template pattern and optional rules using single-letter variables (A-Z) representing digit positions.
 The rules use operators: = (equals), # (not-equals), >=, <=, >, <.
 Multiple values are comma-separated: A=1,2,3.
+Variables can be compared with others: A#B
 Conditions combine with "and" / "or" / "not".
 Conditions can use chain operators and mix variables and integers.
 
@@ -241,11 +257,12 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
     lines = []
     batch_cells_info = []
     for i, entry in enumerate(batch):
+        cond_strs = " -- ".join(_cond_to_str(c) for c in entry["conditions"])
         lines.append(f"[{i}]")
         lines.append(f'  Cell value: {entry["cell"]}')
         lines.append(f'  Template: {entry["template"]}')
         lines.append(f'  Requirements: {entry["requirements"]}')
-        lines.append(f"  Parsed conditions (full AST): {json.dumps(entry['conditions'], indent=2)}")
+        lines.append(f"  Parsed conditions: {cond_strs}")
         batch_cells_info.append({
             "cell": entry["cell"],
             "template": entry["template"],
