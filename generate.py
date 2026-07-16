@@ -20,7 +20,7 @@ if not conditions:
     print(0)
     sys.exit(0)
 else:
-    for combo in itertools.product("0123456789", repeat=len(vars)):
+    for combo in itertools.product("123456789", repeat=len(vars)):
         ctx = dict(zip(vars, combo))
         if all(execute_all(conditions, ctx)):
             s = template

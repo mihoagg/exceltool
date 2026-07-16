@@ -10,7 +10,7 @@ from excel_helpers import parse_dinh_dang
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-EXCEL_PATH = Path(r"C:\Users\PhuThaiCAT\Desktop\Code\vnsky\dinh_dang_095_soluong.xlsx")
+EXCEL_PATH = Path(r"C:\Users\PhuThaiCAT\Desktop\Code\vnsky\excel\dinh_dang_095_soluong.xlsx")
 
 
 def generate_count(template: str, rule_str: str) -> int:

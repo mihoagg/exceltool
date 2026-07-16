@@ -18,9 +18,22 @@ load_dotenv()
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-EXCEL_PATH = Path(r"C:\Users\PhuThaiCAT\Desktop\Code\vnsky\dinh_dang_095_soluong.xlsx")
+EXCEL_PATH = Path(r"C:\Users\PhuThaiCAT\Desktop\Code\vnsky\excel\dinh_dang_095_soluong.xlsx")
 SHEET_NAME = "Định dạng 095"
-API_BASE = "https://openrouter.ai/api/v1/chat/completions"
+_API_BASES = {
+    "groq": "https://api.groq.com/openai/v1/chat/completions",
+    "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+}
+
+def _detect_provider() -> str:
+    if os.getenv("GROQ_API_KEY"):
+        return "groq"
+    if os.getenv("OPENROUTER_API_KEY"):
+        return "openrouter"
+    return "groq"
+
+PROVIDER = _detect_provider()
+API_BASE = _API_BASES[PROVIDER]
 FAIL_LOG = Path("failures.jsonl")
 BATCH_SIZE = 10
 BATCH_DELAY = 1
@@ -107,47 +120,83 @@ def _cond_to_str(cond: dict) -> str:
     if t == "not":
         return "not " + _cond_to_str(cond["children"][0])
     field = cond.get("field", "?")
-    op_map = {"equals": "=", "not_equals": "#", "gte": ">=", "lte": "<=", "gt": ">", "lt": "<"}
+    vals = cond.get("values", [])
+    if t == "equals":
+        return f"{field} \u2208 {{{', '.join(vals)}}}"
+    if t == "not_equals":
+        return f"{field} \u2209 {{{', '.join(vals)}}}"
+    op_map = {"gte": ">=", "lte": "<=", "gt": ">", "lt": "<"}
     op = op_map.get(t, "?")
-    vals = ", ".join(cond.get("values", []))
-    return f"{field} {op} {vals}"
+    return f"{field} {op} {', '.join(vals)}"
 
 
 def _flatten_conditions(conditions: list[dict]) -> list[dict]:
     flat = []
     for c in conditions:
         t = c.get("type")
-        if t in ("and", "or", "not"):
+        if t == "or":
+            flat.append(c)
+        elif t in ("and", "not"):
             flat.extend(_flatten_conditions(c.get("children", [])))
         else:
             flat.append(c)
     return flat
 
 
-BATCH_SYSTEM_PROMPT = """You validate a phone-number rule parser.
-Each cell contains a template pattern and optional rules using single-letter variables (A-Z) representing digit positions.
-Operators: = , # (not-equals), >=, <=, >, <.
-Values are comma-separated: A=1,2,3 (this means A can only be 1, 2 or 3)
-Variables can be compared: A#B
-Conditions combine with "and" / "or" / "not". example: A#B, A#1 and B#2 -> all 3 conditions must be met at the same time. 
-Tere can be chain operators and mix vars and ints.
+BATCH_SYSTEM_PROMPT = """
+You validate a phone-number rule parser.
 
-You will receive MULTIPLE cells, Check EACH cell independently.
+Each cell contains:
+- a template
+- parser output
 
-Check for:
-1. Confirm parsed format is correct.
-2. AMBIGUOUS / QUIRKY SYNTAX — things the parser might misinterpret:
-   - Skip if output is correct
-   - Number in values outside 0-9 (e.g., A=12)
-   - Unusual characters in the template (dots, underscores, etc.) mixed with uppercase variable letters
-   - Potentially unintended chain patterns
-   - Trailing/missing commas or spaces
-Respond ONLY with a JSON object. Keys are cell indices (as strings: "0", "1", "2"...).
-Values are arrays of issues for that cell, or [] if none.
+The template is written for human interpretation, difficult to parse systematically. Validate ONLY whether the parser output is logically equivalent to the constraints implied by the template after applying the interpretation rules below. Ignore differences in formatting, ordering, grouping, or equivalent logical expressions.
 
-Issue format: {"type": "incorrect_parse"|"quirky_syntax", "severity": "warn"|"fail", "detail": "..."}
 
-Output ONLY JSON object."""
+Grammar
+
+Variables:
+A-Z represent digit positions.
+
+Operators:
+=  allowed values
+#  not equal (displayed as ∉)
+>, >=, <, <=
+
+Rules:
+A=1,2,B      -> A ∈ {1,2,B}
+A#B          -> A ∉ {B}
+A#5,B          -> A ∉ {5,B}
+AB#12        -> A∉{1} OR B∉{2}
+AB=12        -> A∈{1} AND B∈{2}
+
+# chains expand into ALL pairwise comparisons.
+
+Examples:
+A#B#C
+-> A#B
+-> A#C
+-> B#C
+
+A#B#5
+-> A#B
+-> A#5
+-> B#5
+
+Comma-separated conditions mean AND.
+
+Example:
+A#B, A#1 and B#2
+means
+A#B AND A#1 AND B#2
+
+Check each cell independently.
+
+Return ONLY a JSON object. No explanation. No thinking. No markdown.
+
+Format: {"0": [{"type": "incorrect_parse", "severity": "fail", "detail": "..."}], "1": []}
+Keys are cell indices ("0", "1", ...). Values are arrays of issues. Empty array = no issues.
+"""
 
 
 def _strip_markdown_json(raw: str) -> str:
@@ -272,10 +321,9 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
         template_vars = [ch for ch in entry["template"] if ch.isupper() and ch.isalpha()]
         lines.append(f"[{i}]")
         lines.append(f'  Cell: {entry["cell"]}')
-        lines.append(f'  Tpl: {entry["template"]}')
-        lines.append(f'  Vars: {{{",".join(sorted(set(template_vars)))}}}')
+        # lines.append(f'  Vars: {{{",".join(sorted(set(template_vars)))}}}')
         lines.append(f'  Req: {entry["requirements"]}')
-        lines.append(f"  Parsed: {cond_strs}")
+        lines.append(f'  "parsed_conditions":{json.dumps([_cond_to_str(c) for c in _flatten_conditions(entry["conditions"])], ensure_ascii=False)}')
         batch_cells_info.append({
             "cell": entry["cell"],
             "template": entry["template"],
@@ -283,6 +331,7 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
         })
 
     prompt = "Cells to validate:\n\n" + "\n".join(lines)
+    print(prompt)
 
     def try_parse(text: str) -> dict | None:
         cleaned = _strip_markdown_json(text)
@@ -331,6 +380,8 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
         raw = content
         parsed = try_parse(raw)
         if parsed is not None:
+            if isinstance(parsed, list):
+                parsed = {str(i): v for i, v in enumerate(parsed)}
             break
 
         _save_llm_error(raw, batch)
@@ -344,10 +395,12 @@ def llm_check_batch(batch: list[dict], model: str, api_key: str,
                    "detail": "LLM API call failed after all retries"}] for _ in batch]
 
     results = []
+    if isinstance(parsed, dict) and "type" in parsed:
+        parsed = {"0": [parsed]}
     for i in range(len(batch)):
         cell_issues = parsed.get(str(i), [])
         if isinstance(cell_issues, list):
-            filtered = [i for i in cell_issues if not _is_false_positive(i)]
+            filtered = [issue for issue in cell_issues if not _is_false_positive(issue)]
             for issue in filtered:
                 issue["stage"] = "llm"
             results.append(filtered)
@@ -395,10 +448,11 @@ def _print_table(results: list[dict]):
     print(f"Total: {len(results)} | PASS: {pass_count} | WARN: {warn_count} | FAIL: {fail_count}")
 
 
-def _write_json(results: list[dict], api_errors: list[dict], path: str):
+def _write_json(results: list[dict], api_errors: list[dict], path: str, model: str = ""):
     report = {
         "metadata": {
-            "model": os.getenv("OPENROUTER_MODEL", "openrouter/free"),
+            "model": model,
+            "provider": _detect_provider(),
             "total_rows": len(results),
             "date": time.strftime("%Y-%m-%d %H:%M:%S"),
         },
@@ -422,16 +476,20 @@ def main():
     parser = argparse.ArgumentParser(description="Validate cell formats and LLM-check parser compatibility.")
     parser.add_argument("--max-rows", type=int, default=None, help="Limit rows to process")
     parser.add_argument("--index", type=int, default=None, help="Start processing from this row number")
-    parser.add_argument("--model", default=None, help="OpenRouter model (default: OPENROUTER_MODEL env or openrouter/free)")
+    parser.add_argument("--model", default=None, help=f"Model (default: GROQ_MODEL/OPENROUTER_MODEL env, provider={PROVIDER})")
     parser.add_argument("--output", default="validation_report.json", help="JSON output path")
     args = parser.parse_args()
 
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENROUTER_API_KEY")
     if not api_key:
-        print("ERROR: OPENROUTER_API_KEY environment variable is not set", file=sys.stderr)
+        print("ERROR: neither GROQ_API_KEY nor OPENROUTER_API_KEY is set", file=sys.stderr)
         sys.exit(1)
 
-    model = args.model or os.getenv("OPENROUTER_MODEL", "openrouter/free")
+    provider = _detect_provider()
+    if provider == "groq":
+        model = args.model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    else:
+        model = args.model or os.getenv("OPENROUTER_MODEL", "openrouter/free")
 
     wb = openpyxl.load_workbook(EXCEL_PATH)
     ws = wb[SHEET_NAME]
@@ -514,7 +572,7 @@ def main():
 
     print()
     _print_table(results)
-    _write_json(results, api_errors, args.output)
+    _write_json(results, api_errors, args.output, model)
     print(f"\nReport written to {args.output}")
 
 

@@ -25,6 +25,8 @@ def split_conditions(rule_str: str) -> list[str]:
                     m = re.match(r'\s*(\d+)\s*(?:[=#]|>=|<=|>|<)', after)
                 if not m:
                     m = re.match(r'\s*not\s+[A-Za-z0-9]', after)
+                if not m:
+                    m = re.match(r'\s*\(', after)
                 if m:
                     parts.append(rule_str[start:i].strip())
                     start = i + 1
@@ -181,8 +183,9 @@ def _parse_single(expr: str) -> dict:
                             parts.append(rest_right)
                         break
                 children = []
-                for i in range(len(parts) - 1):
-                    children.append(_build_node(parts[i], "#", [parts[i + 1]]))
+                for i in range(len(parts)):
+                    for j in range(i + 1, len(parts)):
+                        children.append(_build_node(parts[i], "#", [parts[j]]))
                 if len(children) == 1:
                     return children[0]
                 return {"type": "and", "children": children}
@@ -344,6 +347,19 @@ def _expand_multi_field_conditions(conditions: list[str]) -> list[str]:
     return result
 
 
+def _flatten_and(cond):
+    if cond.get("type") == "and":
+        result = []
+        for child in cond.get("children", []):
+            if child.get("type") == "and":
+                flat = _flatten_and(child)
+                result.extend(flat["children"])
+            else:
+                result.append(child)
+        return {"type": "and", "children": result}
+    return cond
+
+
 def parse(rule_str: str) -> list[dict]:
     raw_conditions = split_conditions(rule_str)
     expanded = _expand_multi_field_conditions(raw_conditions)
@@ -352,7 +368,8 @@ def parse(rule_str: str) -> list[dict]:
         pc = parse_condition(c)
         if pc:
             if pc.get("type") == "and":
-                result.extend(pc["children"])
+                flat = _flatten_and(pc)
+                result.extend(flat["children"])
             else:
                 result.append(pc)
     return result
